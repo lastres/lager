@@ -66,10 +66,11 @@
         formatter,
         formatter_config,
         sync_on,
+        do_check = false,
         check_interval = ?DEFAULT_CHECK_INTERVAL,
         sync_interval = ?DEFAULT_SYNC_INTERVAL,
         sync_size = ?DEFAULT_SYNC_SIZE,
-        last_check = os:timestamp()
+        last_check_size = 0
     }).
 
 -type option() :: {file, string()} | {level, lager:log_level()} |
@@ -115,7 +116,7 @@ init(LogFileConfig) when is_list(LogFileConfig) ->
                     ?INT_LOG(error, "Failed to open log file ~s with error ~s", [Name, file:format_error(Reason)]),
                     State0#state{flap=true}
             end,
-            {ok, State}
+            {ok, schedule_file_check(State)}
     end.
 
 %% @private
@@ -137,7 +138,7 @@ handle_event({log, Message},
     #state{name=Name, level=L,formatter=Formatter,formatter_config=FormatConfig} = State) ->
     case lager_util:is_loggable(Message,L,{lager_file_backend, Name}) of
         true ->
-            {ok,write(State, lager_msg:timestamp(Message), lager_msg:severity_as_int(Message), Formatter:format(Message,FormatConfig)) };
+            {ok,write(State, lager_msg:severity_as_int(Message), Formatter:format(Message,FormatConfig)) };
         false ->
             {ok, State}
     end;
@@ -148,7 +149,9 @@ handle_event(_Event, State) ->
 handle_info({rotate, File}, #state{name=File,count=Count,date=Date} = State) ->
     lager_util:rotate_logfile(File, Count),
     schedule_rotation(File, Date),
-    {ok, State};
+    {ok, State#state{last_check_size=0}};
+handle_info(do_file_check, State) ->
+    {ok, State#state{do_check=true}};
 handle_info(_Info, State) ->
     {ok, State}.
 
@@ -181,10 +184,12 @@ config_to_id(Config) ->
     end.
 
 
-write(#state{name=Name, fd=FD, inode=Inode, flap=Flap, size=RotSize,
-        count=Count} = State, Timestamp, Level, Msg) ->
-    LastCheck = timer:now_diff(Timestamp, State#state.last_check) div 1000,
-    case LastCheck >= State#state.check_interval orelse FD == undefined of
+write(#state{name=Name, fd=FD, inode=Inode, flap=Flap, size=RotSize, last_check_size=LastSize,
+        count=Count, do_check=DoCheck} = State, Level, Msg) ->
+    BinaryMessage = unicode:characters_to_binary(Msg),
+    MsgSize = size(BinaryMessage),
+    NewSize = LastSize + MsgSize,
+    case NewSize >= RotSize orelse FD == undefined orelse DoCheck of
         true ->
             %% need to check for rotation
             case lager_util:ensure_logfile(Name, FD, Inode, {State#state.sync_size, State#state.sync_interval}) of
@@ -192,39 +197,40 @@ write(#state{name=Name, fd=FD, inode=Inode, flap=Flap, size=RotSize,
                     case lager_util:rotate_logfile(Name, Count) of
                         ok ->
                             %% go around the loop again, we'll do another rotation check and hit the next clause of ensure_logfile
-                            write(State, Timestamp, Level, Msg);
+                            write(State, Level, Msg);
                         {error, Reason} ->
                             case Flap of
                                 true ->
                                     State;
                                 _ ->
                                     ?INT_LOG(error, "Failed to rotate log file ~s with error ~s", [Name, file:format_error(Reason)]),
-                                    State#state{flap=true}
+                                    schedule_file_check(State#state{flap=true})
                             end
                     end;
-                {ok, {NewFD, NewInode, _}} ->
+                {ok, {NewFD, NewInode, Size}} ->
                     %% update our last check and try again
-                    do_write(State#state{last_check=Timestamp, fd=NewFD, inode=NewInode}, Level, Msg);
+                    do_write(State#state{last_check_size=(Size + MsgSize), fd=NewFD, inode=NewInode}, Level, BinaryMessage);
                 {error, Reason} ->
                     case Flap of
                         true ->
                             State;
                         _ ->
                             ?INT_LOG(error, "Failed to reopen log file ~s with error ~s", [Name, file:format_error(Reason)]),
-                            State#state{flap=true}
+                            schedule_file_check(State#state{flap=true})
                     end
             end;
         false ->
-            do_write(State, Level, Msg)
+            do_write(State#state{last_check_size=NewSize}, Level, BinaryMessage)
     end.
 
-do_write(#state{fd=FD, name=Name, flap=Flap} = State, Level, Msg) ->
+do_write(#state{fd=FD, name=Name, flap=Flap} = State, Level, BinaryMsg) ->
     %% delayed_write doesn't report errors
-    _ = file:write(FD, unicode:characters_to_binary(Msg)),
+    _ = file:write(FD, BinaryMsg),
     {mask, SyncLevel} = State#state.sync_on,
     case (Level band SyncLevel) /= 0 of
         true ->
             %% force a sync on any message that matches the 'sync_on' bitmask
+            % this might not have effect on Mac OS ??
             Flap2 = case file:datasync(FD) of
                 {error, Reason2} when Flap == false ->
                     ?INT_LOG(error, "Failed to write log message to file ~s: ~s",
@@ -235,10 +241,12 @@ do_write(#state{fd=FD, name=Name, flap=Flap} = State, Level, Msg) ->
                 _ ->
                     Flap
             end,
-            State#state{flap=Flap2};
+            schedule_file_check(State#state{flap=Flap2});
         _ -> 
-            State
+            schedule_file_check(State)
     end.
+
+
 
 validate_loglevel(Level) ->
     try lager_util:config_to_mask(Level) of
@@ -363,6 +371,12 @@ schedule_rotation(Name, Date) ->
     erlang:send_after(lager_util:calculate_next_rotation(Date) * 1000, self(), {rotate, Name}),
     ok.
 
+schedule_file_check(#state{check_interval = 0} = State) ->
+    State#state{do_check = true};
+schedule_file_check(#state{check_interval = CheckInt} = State) ->
+    erlang:send_after(CheckInt, self(), do_file_check),
+    State#state{do_check = false}.
+
 -ifdef(TEST).
 
 get_loglevel_test() ->
@@ -395,14 +409,14 @@ rotation_test_() ->
                    {ok, {FD, Inode, _}} = lager_util:open_logfile("test.log", {SyncSize, SyncInterval}),
                    State0 = DefaultState#state{fd=FD, inode=Inode},
                    ?assertMatch(#state{name="test.log", level=?DEBUG, fd=FD, inode=Inode},
-                                write(State0, os:timestamp(), ?DEBUG, "hello world")),
+                                write(State0, ?DEBUG, "hello world")),
                    file:delete("test.log"),
-                   Result = write(State0, os:timestamp(), ?DEBUG, "hello world"),
+                   Result = write(State0, ?DEBUG, "hello world"),
                    %% assert file has changed
                    ?assert(#state{name="test.log", level=?DEBUG, fd=FD, inode=Inode} =/= Result),
                    ?assertMatch(#state{name="test.log", level=?DEBUG}, Result),
                    file:rename("test.log", "test.log.1"),
-                   Result2 = write(Result, os:timestamp(), ?DEBUG, "hello world"),
+                   Result2 = write(Result, ?DEBUG, "hello world"),
                    %% assert file has changed
                    ?assert(Result =/= Result2),
                    ?assertMatch(#state{name="test.log", level=?DEBUG}, Result2),
@@ -412,52 +426,41 @@ rotation_test_() ->
       fun(DefaultState = #state{sync_size=SyncSize, sync_interval = SyncInterval}) ->
           {"Internal rotation and delayed write",
            fun() ->
-                   CheckInterval = 3000, % 3 sec
-                   RotationSize = 15,
-                   PreviousCheck = os:timestamp(),
+                   RotationSize = 30,
+		   LastSize = 0,
 
                    {ok, {FD, Inode, _}} = lager_util:open_logfile("test.log", {SyncSize, SyncInterval}),
                    State0 = DefaultState#state{
                               fd=FD, inode=Inode, size=RotationSize,
-                              check_interval=CheckInterval, last_check=PreviousCheck},
+			      last_check_size = LastSize},
 
-                   %% new message within check interval with sync_on level
-                   Msg1Timestamp = add_secs(PreviousCheck, 1),
-                   State0 = State1 = write(State0, Msg1Timestamp, ?ERROR, "big big message 1"),
+		   ?assertNot(filelib:is_regular("test.log.0")),
+		   State1 = write(State0, ?ERROR, "big big message 1"),
 
-                   %% new message within check interval under sync_on level
-                   %% not written to disk yet
-                   Msg2Timestamp = add_secs(PreviousCheck, 2),
-                   State0 = State2 = write(State1, Msg2Timestamp, ?DEBUG, "buffered message 2"),
-
-                   %% although file size is big enough...
+                   %%  file size is not big enough...
                    {ok, FInfo} = file:read_file_info("test.log"),
-                   ?assert(RotationSize < FInfo#file_info.size),
+                   ?assert(RotationSize > FInfo#file_info.size),
                    %% ...no rotation yet
-                   ?assertEqual(PreviousCheck, State2#state.last_check),
                    ?assertNot(filelib:is_regular("test.log.0")),
 
-                   %% new message after check interval
-                   Msg3Timestamp = add_secs(PreviousCheck, 4),
-                   _State3 = write(State2, Msg3Timestamp, ?DEBUG, "message 3"),
+		   State2 = write(State1, ?DEBUG, "big big message 2"),
+
+		   timer:sleep(2000),
+		   _State3 = write(State2, ?DEBUG, "message 3"),
 
                    %% rotation happened
                    ?assert(filelib:is_regular("test.log.0")),
 
                    {ok, Bin1} = file:read_file("test.log.0"),
                    {ok, Bin2} = file:read_file("test.log"),
-                   %% message 1-3 written to file
-                   ?assertEqual(<<"big big message 1buffered message 2">>, Bin1),
-                   %% message 4 buffered, not yet written to file
+                   %% message 1-2 written to file
+                   ?assertEqual(<<"big big message 1big big message 2">>, Bin1),
+                   %% message 3 buffered, not yet written to file,
                    ?assertEqual(<<"">>, Bin2),
                    ok
            end}
       end
      ]}.
-
-add_secs({Mega, Secs, Micro}, Add) ->
-    NewSecs = Secs + Add,
-    {Mega + NewSecs div 10000000, NewSecs rem 10000000, Micro}.
 
 filesystem_test_() ->
     {foreach,
@@ -571,7 +574,7 @@ filesystem_test_() ->
             },
             {"internal size rotation should work",
                 fun() ->
-                        gen_event:add_handler(lager_event, lager_file_backend, [{file, "test.log"}, {level, info}, {check_interval, 0}, {size, 10}]),
+                        gen_event:add_handler(lager_event, lager_file_backend, [{file, "test.log"}, {level, info}, {size, 15}, {check_interval, 0}]),
                         lager:log(error, self(), "Test message1"),
                         lager:log(error, self(), "Test message1"),
                         ?assert(filelib:is_regular("test.log.0"))
