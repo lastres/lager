@@ -56,6 +56,9 @@
             {async_threshold, 20},
             %% Switch back to async mode, when gen_event mailbox size decrease from `async_threshold'
             %% to async_threshold - async_threshold_window
-            {async_threshold_window, 5}
+            {async_threshold_window, 5},
+            %% Whether or not to add a timestamp to the metadata, that will allow to record date and time.
+            %% Can be set to false for performance improvement
+            {use_timestamp, true}
         ]}
  ]}.
